@@ -21,8 +21,8 @@ from pathlib import Path
 import numpy as np
 
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from blinkpy import api
 from blinkpy.auth import Auth, BlinkTwoFARequiredError, LoginError
@@ -256,6 +256,7 @@ class Daemon:
         self._task: asyncio.Task | None = None
         self._blink: Blink | None = None
         self._ts_buf: collections.deque | None = None  # shared with _stream_and_detect
+        self._proxy_url: str | None = None
 
     def _emit(self, msg: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -342,6 +343,7 @@ class Daemon:
         await ls.start(host="127.0.0.1", port=0)
         proxy_url = ls.url
         feed_task = asyncio.create_task(ls.feed())
+        self._proxy_url = proxy_url
         await asyncio.sleep(2)
         self._emit("Stream open — monitoring for motion")
 
@@ -420,6 +422,7 @@ class Daemon:
             self._emit("Stream ended — will reconnect")
         finally:
             self._ts_buf = None
+            self._proxy_url = None
             buffer_task.cancel()
             for proc in (analysis_proc, buffer_proc):
                 proc.kill()
@@ -599,6 +602,28 @@ async def delete_clip(filename: str):
     return {"ok": True}
 
 
+@app.get("/snapshot.jpg")
+async def snapshot():
+    if daemon._proxy_url is None:
+        raise HTTPException(status_code=503, detail="Stream not active")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-loglevel", "error",
+            "-i", daemon._proxy_url,
+            "-vframes", "1",
+            "-f", "image2pipe", "-vcodec", "mjpeg",
+            "pipe:1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=503, detail="Snapshot timed out")
+    if not stdout:
+        raise HTTPException(status_code=503, detail="No frame captured")
+    return Response(content=stdout, media_type="image/jpeg")
+
+
 # ---------------------------------------------------------------------------
 # Inline HTML
 # ---------------------------------------------------------------------------
@@ -659,6 +684,11 @@ HTML = """<!DOCTYPE html>
   .clip-body video { width: 100%; display: block; background: #000; max-height: 320px; }
   .clip-actions { padding: 8px 12px; display: flex; gap: 8px; }
   .empty { color: #4b5563; font-size: .9rem; margin-top: 40px; text-align: center; }
+  .live-section { margin-bottom: 20px; }
+  .live-section h2 { font-size: .75rem; font-weight: 600; text-transform: uppercase;
+                     letter-spacing: .08em; color: #6b7280; margin-bottom: 10px; }
+  #live-img { width: 100%; max-width: 640px; border-radius: 8px; background: #111;
+              display: block; border: 1px solid #2a2a2a; }
 </style>
 </head>
 <body>
@@ -692,6 +722,10 @@ HTML = """<!DOCTYPE html>
     <div class="log-box" id="log-box"></div>
   </div>
   <div class="content">
+    <div class="live-section" id="live-section" style="display:none">
+      <h2>Live View</h2>
+      <img id="live-img" alt="Live snapshot">
+    </div>
     <div class="clip-list" id="clip-list"></div>
     <p class="empty" id="empty-msg" style="display:none">No clips yet. Start the daemon to begin monitoring.</p>
   </div>
@@ -813,6 +847,8 @@ function renderLog(entries) {
   document.getElementById('log-box').innerHTML = entries.map(e => `<p>${e}</p>`).join('');
 }
 
+let _liveRunning = false;
+
 function renderStatus(s) {
   const dot = document.getElementById('dot');
   const label = document.getElementById('status-label');
@@ -822,13 +858,24 @@ function renderStatus(s) {
   document.getElementById('cfg-threshold').value = s.config.motion_threshold;
   document.getElementById('cfg-cooldown').value  = s.config.cooldown;
   document.getElementById('cfg-camera').value    = s.config.camera_name;
+  const wasRunning = _liveRunning;
+  _liveRunning = s.running;
+  document.getElementById('live-section').style.display = s.running ? '' : 'none';
+  if (s.running && !wasRunning) refreshSnapshot();
+}
+
+function refreshSnapshot() {
+  if (!_liveRunning) return;
+  const img = document.getElementById('live-img');
+  img.src = '/snapshot.jpg?t=' + Date.now();
+  img.onload = img.onerror = () => setTimeout(refreshSnapshot, 2000);
 }
 
 async function refresh() {
   const s = await api('GET', '/status');
   renderStatus(s);
   renderLog(s.log);
-  renderClips(s.clips);  // clips is now [{name, size}, ...]
+  renderClips(s.clips);
 }
 
 refresh();
@@ -841,7 +888,11 @@ setInterval(refresh, 5000);
 # ---------------------------------------------------------------------------
 
 def main():
-    uvicorn.run(app, host="0.0.0.0", port=8080, log_level="warning")
+    import argparse
+    parser = argparse.ArgumentParser(description="blinkvault — Blink camera motion capture")
+    parser.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
+    args = parser.parse_args()
+    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":
