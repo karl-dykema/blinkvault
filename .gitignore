@@ -3,6 +3,11 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Build / PyPI
+dist/
+build/
+*.egg-info/
+
 # Blink credentials — never commit these
 creds.json
 

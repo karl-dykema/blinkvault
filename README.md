@@ -55,21 +55,34 @@ Blink sessions time out after approximately 5 minutes. blinkvault detects stream
 
 ---
 
-## Setup
+## Installation
 
+**From PyPI:**
 ```bash
-git clone https://github.com/yourusername/blinkvault
-cd blinkvault
+pip install blinkvault
+```
 
+**From source:**
+```bash
+git clone https://github.com/karl-dykema/blinkvault
+cd blinkvault
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 ```
+
+> **Requires [ffmpeg](https://ffmpeg.org/)** on your `$PATH`.
+> macOS: `brew install ffmpeg`
 
 ---
 
 ## Web interface
 
+```bash
+blinkvault
+```
+
+Or if running from source:
 ```bash
 python app.py
 ```
@@ -91,20 +104,18 @@ On first run you will be prompted for your Blink email, password, and a two-fact
 
 ## CLI livestream
 
-`stream.py` is a standalone script for on-demand livestreaming:
-
 ```bash
 # Watch live in a player
-python stream.py --output - | ffplay -
+blinkvault-stream --output - | ffplay -
 
 # Record to file
-python stream.py --output recording.mp4
+blinkvault-stream --output recording.mp4
 
 # Stream to UDP (e.g. for VLC or Frigate)
-python stream.py --output udp://127.0.0.1:1234
+blinkvault-stream --output udp://127.0.0.1:1234
 
 # Pick a specific camera by name
-python stream.py --camera "Front Door" --output recording.mp4
+blinkvault-stream --camera "Front Door" --output recording.mp4
 ```
 
 ---
