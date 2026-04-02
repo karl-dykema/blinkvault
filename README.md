@@ -137,6 +137,15 @@ Settings are saved to `capture_config.json` (gitignored) via the web UI, or you 
 
 ---
 
+## Acknowledgements
+
+- **[blinkpy](https://github.com/fronzbot/blinkpy)** by Kevin Fronczak — Python API library for Blink cameras. blinkvault is built on top of blinkpy for authentication, camera discovery, and the `BlinkLiveStream` IMMI protocol implementation.
+- **[FFmpeg](https://ffmpeg.org/)** — used for stream demuxing, grayscale frame extraction, motion analysis, and MP4 encoding.
+- **[FastAPI](https://fastapi.tiangolo.com/)** — web framework powering the local UI.
+- **[numpy](https://numpy.org/)** — frame differencing for local motion detection.
+
+---
+
 ## License
 
 MIT
