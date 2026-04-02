@@ -355,6 +355,7 @@ class Daemon:
             "-i", proxy_url,
             "-c", "copy", "-f", "mpegts", "pipe:1",
             stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
 
         async def _read_buffer():
@@ -380,6 +381,7 @@ class Daemon:
             "-vf", f"scale={ANALYSIS_W}:{ANALYSIS_H},fps={ANALYSIS_FPS}",
             "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
             stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
 
         prev_frame: np.ndarray | None = None

@@ -211,7 +211,7 @@ async def stream(camera, output: str) -> None:
 
     cmd = [
         "ffmpeg",
-        "-loglevel", "warning",
+        "-loglevel", "error",
         "-y",
         "-analyzeduration", "10000000",
         "-probesize",        "10000000",
