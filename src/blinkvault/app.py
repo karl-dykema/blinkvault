@@ -257,6 +257,7 @@ class Daemon:
         self._blink: Blink | None = None
         self._ts_buf: collections.deque | None = None  # shared with _stream_and_detect
         self._proxy_url: str | None = None
+        self._latest_jpeg: bytes | None = None
 
     def _emit(self, msg: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -344,6 +345,7 @@ class Daemon:
         proxy_url = ls.url
         feed_task = asyncio.create_task(ls.feed())
         self._proxy_url = proxy_url
+        asyncio.create_task(self._snapshot_loop(proxy_url))
         await asyncio.sleep(2)
         self._emit("Stream open — monitoring for motion")
 
@@ -423,6 +425,7 @@ class Daemon:
         finally:
             self._ts_buf = None
             self._proxy_url = None
+            self._latest_jpeg = None
             buffer_task.cancel()
             for proc in (analysis_proc, buffer_proc):
                 proc.kill()
@@ -436,6 +439,26 @@ class Daemon:
             except asyncio.CancelledError:
                 pass
             ls.stop()
+
+    async def _snapshot_loop(self, proxy_url: str) -> None:
+        while self._proxy_url == proxy_url:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-loglevel", "error",
+                    "-f", "mpegts",
+                    "-analyzeduration", "1000000", "-probesize", "1000000",
+                    "-i", proxy_url,
+                    "-vframes", "1", "-f", "image2pipe", "-vcodec", "mjpeg",
+                    "pipe:1",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                if stdout:
+                    self._latest_jpeg = stdout
+            except Exception:
+                pass
+            await asyncio.sleep(2)
 
     async def _save_clip_from_buffer(
         self, ts_buf: collections.deque, motion_ts: float, duration: int, out_path: Path
@@ -604,26 +627,13 @@ async def delete_clip(filename: str):
 
 @app.get("/snapshot.jpg")
 async def snapshot():
-    if daemon._proxy_url is None:
-        raise HTTPException(status_code=503, detail="Stream not active")
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-loglevel", "error",
-            "-f", "mpegts",
-            "-analyzeduration", "5000000", "-probesize", "5000000",
-            "-i", daemon._proxy_url,
-            "-vframes", "1",
-            "-f", "image2pipe", "-vcodec", "mjpeg",
-            "pipe:1",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=503, detail="Snapshot timed out")
-    if not stdout:
-        raise HTTPException(status_code=503, detail="No frame captured")
-    return Response(content=stdout, media_type="image/jpeg")
+    if daemon._latest_jpeg is None:
+        raise HTTPException(status_code=503, detail="No snapshot available yet")
+    return Response(
+        content=daemon._latest_jpeg,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -869,8 +879,11 @@ function renderStatus(s) {
 function refreshSnapshot() {
   if (!_liveRunning) return;
   const img = document.getElementById('live-img');
-  img.src = '/snapshot.jpg?t=' + Date.now();
-  img.onload = img.onerror = () => setTimeout(refreshSnapshot, 2000);
+  const url = '/snapshot.jpg?t=' + Date.now();
+  const tmp = new Image();
+  tmp.onload = () => { document.getElementById('live-img').src = tmp.src; setTimeout(refreshSnapshot, 2000); };
+  tmp.onerror = () => setTimeout(refreshSnapshot, 2000);
+  tmp.src = url;
 }
 
 async function refresh() {
