@@ -32,7 +32,7 @@ from blinkpy.livestream import BlinkLiveStream
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("blinkvault")
 
-BASE_DIR    = Path(__file__).parent
+BASE_DIR    = Path.cwd()
 CREDS_FILE  = BASE_DIR / "creds.json"
 CONFIG_FILE = BASE_DIR / "capture_config.json"
 CLIPS_DIR   = BASE_DIR / "clips"
