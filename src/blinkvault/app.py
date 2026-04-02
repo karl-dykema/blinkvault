@@ -30,7 +30,7 @@ from blinkpy.blinkpy import Blink
 from blinkpy.livestream import BlinkLiveStream
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("blink-capture")
+log = logging.getLogger("blinkvault")
 
 BASE_DIR    = Path(__file__).parent
 CREDS_FILE  = BASE_DIR / "creds.json"
@@ -609,7 +609,7 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Blink Capture</title>
+<title>blinkvault</title>
 <script data-goatcounter="https://blinkvault.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -665,7 +665,7 @@ HTML = """<!DOCTYPE html>
 <body>
 <header>
   <div class="dot" id="dot"></div>
-  <h1>Blink Capture</h1>
+  <h1>blinkvault</h1>
   <span class="status-label" id="status-label">Stopped</span>
   <div style="margin-left:auto; display:flex; gap:8px;">
     <button class="btn btn-green" onclick="daemonStart()">Start</button>
