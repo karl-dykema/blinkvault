@@ -148,4 +148,4 @@ Settings are saved to `capture_config.json` (gitignored) via the web UI, or you 
 
 ## License
 
-MIT
+GPL-3.0 — see [LICENSE](LICENSE)
