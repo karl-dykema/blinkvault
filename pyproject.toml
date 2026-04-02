@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blinkvault"
-version = "0.1.7"
+version = "0.1.8"
 description = "Local motion capture for Blink cameras — no subscription, 30s pre-roll, in-memory buffer"
 readme = "README.md"
 license = { file = "LICENSE" }

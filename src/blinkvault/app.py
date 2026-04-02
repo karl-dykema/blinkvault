@@ -443,19 +443,24 @@ class Daemon:
     async def _snapshot_loop(self, proxy_url: str) -> None:
         while self._proxy_url == proxy_url:
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg", "-loglevel", "error",
-                    "-f", "mpegts",
-                    "-analyzeduration", "1000000", "-probesize", "1000000",
-                    "-i", proxy_url,
-                    "-vframes", "1", "-f", "image2pipe", "-vcodec", "mjpeg",
-                    "pipe:1",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-                if stdout:
-                    self._latest_jpeg = stdout
+                if self._ts_buf:
+                    now = time.monotonic()
+                    raw = b"".join(chunk for t, chunk in list(self._ts_buf) if t > now - 2)
+                    if raw:
+                        proc = await asyncio.create_subprocess_exec(
+                            "ffmpeg", "-loglevel", "error",
+                            "-f", "mpegts", "-i", "pipe:0",
+                            "-vframes", "1", "-f", "image2pipe", "-vcodec", "mjpeg",
+                            "pipe:1",
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        stdout, _ = await asyncio.wait_for(
+                            proc.communicate(input=raw), timeout=5.0
+                        )
+                        if stdout:
+                            self._latest_jpeg = stdout
             except Exception:
                 pass
             await asyncio.sleep(2)
