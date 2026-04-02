@@ -838,5 +838,9 @@ setInterval(refresh, 5000);
 
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main():
     uvicorn.run(app, host="0.0.0.0", port=8080, log_level="warning")
+
+
+if __name__ == "__main__":
+    main()
