@@ -252,9 +252,10 @@ class Daemon:
         self.running = False
         self.recording = False
         self.last_event: str | None = None
-        self.log: list[str] = []          # recent activity log (newest first)
+        self.log: list[str] = []
         self._task: asyncio.Task | None = None
         self._blink: Blink | None = None
+        self._ts_buf: collections.deque | None = None  # shared with _stream_and_detect
 
     def _emit(self, msg: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -346,6 +347,7 @@ class Daemon:
 
         # Rolling in-memory buffer: deque of (monotonic_time, bytes) chunks
         ts_buf: collections.deque = collections.deque()
+        self._ts_buf = ts_buf  # expose for Record Now
         buf_bytes = 0
 
         buffer_proc = await asyncio.create_subprocess_exec(
@@ -415,6 +417,7 @@ class Daemon:
         except asyncio.IncompleteReadError:
             self._emit("Stream ended — will reconnect")
         finally:
+            self._ts_buf = None
             buffer_task.cancel()
             for proc in (analysis_proc, buffer_proc):
                 proc.kill()
@@ -503,28 +506,22 @@ async def daemon_stop():
 
 @app.post("/daemon/record")
 async def daemon_record_now():
-    """Trigger an immediate recording regardless of motion."""
-    if not daemon.running or daemon._blink is None:
+    """Trigger an immediate recording from the live buffer."""
+    if not daemon.running:
         return {"ok": False, "error": "Daemon not running"}
     if daemon.recording:
         return {"ok": False, "error": "Already recording"}
+    if daemon._ts_buf is None:
+        return {"ok": False, "error": "Stream not ready yet — wait a moment and try again"}
 
     cfg = load_config()
-    cam_name = cfg.get("camera_name", "")
-    _, camera = find_camera(daemon._blink, cam_name)
-    if camera is None:
-        return {"ok": False, "error": "Camera not found"}
-
-    async def _record():
-        daemon.recording = True
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = CLIPS_DIR / f"manual_{ts}.mp4"
-        daemon._emit(f"Manual record — {cfg['clip_duration']}s: {out_path.name}")
-        ok = await record_clip(camera, cfg["clip_duration"], out_path)
-        daemon._emit(f"Saved: {out_path.name}" if ok else f"Recording failed: {out_path.name}")
-        daemon.recording = False
-
-    asyncio.create_task(_record())
+    daemon.recording = True
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = CLIPS_DIR / f"manual_{ts}.mp4"
+    daemon._emit(f"Manual record — {cfg['clip_duration']}s: {out_path.name}")
+    asyncio.create_task(
+        daemon._save_clip_from_buffer(daemon._ts_buf, time.monotonic(), cfg["clip_duration"], out_path)
+    )
     return {"ok": True}
 
 
