@@ -2,7 +2,7 @@
 
 Local motion capture and livestreaming for Blink cameras — no subscription required.
 
-blinkvault keeps a continuous live stream from your Blink camera in memory, detects motion locally using frame differencing, and saves MP4 clips that include up to **30 seconds of footage before the motion event**. Everything runs on your own machine. No Blink subscription, no cloud clip storage, no always-on disk writes.
+blinkvault keeps a continuous live stream from your Blink camera in memory, detects motion locally using frame differencing, and saves MP4 clips that include up to **30 seconds of footage before the motion event**. It uses the Blink cloud API only to authenticate and open the livestream — all motion detection, buffering, and clip storage happen on your own machine. No Blink subscription required, no cloud clip storage, no always-on disk writes.
 
 ---
 
