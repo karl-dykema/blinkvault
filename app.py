@@ -610,6 +610,7 @@ HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Blink Capture</title>
+<script data-goatcounter="https://blinkvault.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, sans-serif; background: #0f0f0f; color: #e0e0e0; }
