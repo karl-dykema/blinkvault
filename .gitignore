@@ -1,0 +1,22 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Blink credentials — never commit these
+creds.json
+
+# User config and recorded content
+capture_config.json
+clips/
+segments/
+
+# Temp files from clip encoding
+*.tmp.ts
+
+# macOS
+.DS_Store
+
+# Misc
+stream.ts
+stream.mp4
