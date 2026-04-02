@@ -609,6 +609,8 @@ async def snapshot():
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-loglevel", "error",
+            "-f", "mpegts",
+            "-analyzeduration", "5000000", "-probesize", "5000000",
             "-i", daemon._proxy_url,
             "-vframes", "1",
             "-f", "image2pipe", "-vcodec", "mjpeg",
