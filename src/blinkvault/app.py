@@ -912,6 +912,7 @@ def main():
     parser = argparse.ArgumentParser(description="blinkvault — Blink camera motion capture")
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
     args = parser.parse_args()
+    print(f"blinkvault — open your browser to http://localhost:{args.port}")
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
 
 
