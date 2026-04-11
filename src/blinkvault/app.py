@@ -39,8 +39,6 @@ CLIPS_DIR   = BASE_DIR / "clips"
 CLIPS_DIR.mkdir(exist_ok=True)
 
 PRE_ROLL_SECONDS = 30           # seconds of footage before motion to include
-BUF_RATE_EST     = 700_000      # conservative bytes/sec estimate for buffer sizing
-MAX_BUF_BYTES    = int((PRE_ROLL_SECONDS + 35) * BUF_RATE_EST)  # ~45 MB max in RAM
 
 DEFAULT_CONFIG = {
     "clip_duration": 30,
@@ -73,6 +71,10 @@ def save_config(cfg: dict) -> None:
 # ---------------------------------------------------------------------------
 
 class ResilientLiveStream(BlinkLiveStream):
+    def __init__(self, camera, response):
+        super().__init__(camera, response)
+        self.on_data = None  # optional callback(bytes) called for every raw MPEG-TS chunk
+
     async def recv(self):
         try:
             while not self.target_reader.at_eof():
@@ -90,6 +92,8 @@ class ResilientLiveStream(BlinkLiveStream):
                     break
                 if msgtype != 0x00 or data[0] != 0x47:
                     continue
+                if self.on_data:
+                    self.on_data(data)
                 for writer in list(self.clients):
                     if not writer.is_closing():
                         writer.write(data)
@@ -199,6 +203,8 @@ async def init_livestream(camera) -> ResilientLiveStream:
         camera.camera_id,
         camera_type=camera.camera_type,
     )
+    if "server" not in response:
+        raise RuntimeError(f"Liveview API returned no server URL: {response}")
     if not response["server"].startswith("immis://"):
         raise RuntimeError(f"Unsupported stream protocol: {response['server']}")
     return ResilientLiveStream(camera, response)
@@ -309,14 +315,27 @@ class Daemon:
         self._emit(f"Monitoring: {cam_name} — local motion detection active")
 
         try:
+            consecutive_short = 0
             while self.running:
+                stream_start = time.monotonic()
                 try:
                     await self._stream_and_detect(camera, cam_name)
+                    duration = time.monotonic() - stream_start
+                    if duration < 15:
+                        consecutive_short += 1
+                        delay = min(10 * consecutive_short, 60)
+                        self._emit(f"Stream ended quickly ({duration:.0f}s) — backing off {delay}s")
+                        await asyncio.sleep(delay)
+                    else:
+                        consecutive_short = 0
+                        await asyncio.sleep(3)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    self._emit(f"Stream error: {e} — reconnecting in 10s")
-                    await asyncio.sleep(10)
+                    consecutive_short += 1
+                    delay = 30 if "busy" in str(e).lower() or "307" in str(e) else min(10 * consecutive_short, 60)
+                    self._emit(f"Stream error ({type(e).__name__}): {e} — reconnecting in {delay}s")
+                    await asyncio.sleep(delay)
                     # Re-fetch camera after reconnect
                     cfg = load_config()
                     _, camera = find_camera(self._blink, cfg.get("camera_name", "") or cam_name)
@@ -349,38 +368,26 @@ class Daemon:
         await asyncio.sleep(2)
         self._emit("Stream open — monitoring for motion")
 
-        # Rolling in-memory buffer: deque of (monotonic_time, bytes) chunks
+        # Rolling in-memory buffer filled directly from recv() — no extra ffmpeg process needed
         ts_buf: collections.deque = collections.deque()
         self._ts_buf = ts_buf  # expose for Record Now
-        buf_bytes = 0
 
-        buffer_proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-loglevel", "error",
-            "-i", proxy_url,
-            "-c", "copy", "-f", "mpegts", "pipe:1",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+        def _on_data(chunk: bytes) -> None:
+            now = time.monotonic()
+            ts_buf.append((now, chunk))
+            if not self.recording:
+                cutoff = now - PRE_ROLL_SECONDS - 2
+                while ts_buf and ts_buf[0][0] < cutoff:
+                    ts_buf.popleft()
 
-        async def _read_buffer():
-            nonlocal buf_bytes
-            while True:
-                chunk = await buffer_proc.stdout.read(188 * 100)
-                if not chunk:
-                    break
-                now = time.monotonic()
-                ts_buf.append((now, chunk))
-                buf_bytes += len(chunk)
-                if not self.recording:
-                    cutoff = now - PRE_ROLL_SECONDS - 2
-                    while ts_buf and ts_buf[0][0] < cutoff:
-                        buf_bytes -= len(ts_buf.popleft()[1])
-
-        buffer_task = asyncio.create_task(_read_buffer())
+        ls.on_data = _on_data
 
         frame_size = ANALYSIS_W * ANALYSIS_H
         analysis_proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-loglevel", "error",
+            "-fflags", "+nobuffer+discardcorrupt",
+            "-analyzeduration", "2000000",
+            "-probesize", "1000000",
             "-i", proxy_url,
             "-vf", f"scale={ANALYSIS_W}:{ANALYSIS_H},fps={ANALYSIS_FPS}",
             "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
@@ -423,16 +430,15 @@ class Daemon:
         except asyncio.IncompleteReadError:
             self._emit("Stream ended — will reconnect")
         finally:
+            ls.on_data = None
             self._ts_buf = None
             self._proxy_url = None
             self._latest_jpeg = None
-            buffer_task.cancel()
-            for proc in (analysis_proc, buffer_proc):
-                proc.kill()
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
+            try:
+                analysis_proc.kill()
+                await analysis_proc.wait()
+            except Exception:
+                pass
             feed_task.cancel()
             try:
                 await feed_task
@@ -445,10 +451,11 @@ class Daemon:
             try:
                 if self._ts_buf:
                     now = time.monotonic()
-                    raw = b"".join(chunk for t, chunk in list(self._ts_buf) if t > now - 2)
+                    # Use a 10s window to ensure at least one keyframe is included
+                    raw = b"".join(chunk for t, chunk in list(self._ts_buf) if t > now - 10)
                     if raw:
                         proc = await asyncio.create_subprocess_exec(
-                            "ffmpeg", "-loglevel", "error",
+                            "ffmpeg", "-loglevel", "quiet",
                             "-f", "mpegts", "-i", "pipe:0",
                             "-vframes", "1", "-f", "image2pipe", "-vcodec", "mjpeg",
                             "pipe:1",
@@ -461,8 +468,8 @@ class Daemon:
                         )
                         if stdout:
                             self._latest_jpeg = stdout
-            except Exception:
-                pass
+            except Exception as e:
+                self._emit(f"Snapshot error: {e}")
             await asyncio.sleep(2)
 
     async def _save_clip_from_buffer(
@@ -475,9 +482,10 @@ class Daemon:
             pre_start = motion_ts - PRE_ROLL_SECONDS
             clip_end  = motion_ts + duration
 
-            raw = b"".join(chunk for t, chunk in list(ts_buf) if pre_start <= t <= clip_end)
+            chunks = list(ts_buf)
+            raw = b"".join(chunk for t, chunk in chunks if pre_start <= t <= clip_end)
             if not raw:
-                self._emit(f"Buffer empty for {out_path.name}")
+                self._emit(f"Buffer empty for {out_path.name} (buf={len(chunks)} chunks, span={chunks[0][0]:.1f}–{chunks[-1][0]:.1f} want {pre_start:.1f}–{clip_end:.1f})" if chunks else f"Buffer empty for {out_path.name} (no chunks)")
                 return
 
             tmp = out_path.with_suffix(".tmp.ts")
@@ -514,6 +522,9 @@ daemon = Daemon()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Re-apply after uvicorn reconfigures logging at startup
+    logging.getLogger("aiohttp.client").setLevel(logging.CRITICAL)
+    logging.getLogger("blinkpy").setLevel(logging.CRITICAL)
     yield
     await daemon.stop()
 
@@ -705,7 +716,10 @@ HTML = """<!DOCTYPE html>
   .live-section h2 { font-size: .75rem; font-weight: 600; text-transform: uppercase;
                      letter-spacing: .08em; color: #6b7280; margin-bottom: 10px; }
   #live-img { width: 100%; max-width: 640px; border-radius: 8px; background: #111;
-              display: block; border: 1px solid #2a2a2a; }
+              display: block; border: 1px solid #2a2a2a; color: transparent; }
+  #live-placeholder { width: 100%; max-width: 640px; border-radius: 8px; background: #111;
+                      border: 1px solid #2a2a2a; padding: 40px; text-align: center;
+                      color: #4b5563; font-size: .85rem; }
 </style>
 </head>
 <body>
@@ -741,7 +755,8 @@ HTML = """<!DOCTYPE html>
   <div class="content">
     <div class="live-section" id="live-section" style="display:none">
       <h2>Live View</h2>
-      <img id="live-img" alt="Live snapshot">
+      <img id="live-img" alt="" style="display:none">
+      <div id="live-placeholder">Waiting for snapshot...</div>
     </div>
     <div class="clip-list" id="clip-list"></div>
     <p class="empty" id="empty-msg" style="display:none">No clips yet. Start the daemon to begin monitoring.</p>
@@ -878,15 +893,27 @@ function renderStatus(s) {
   const wasRunning = _liveRunning;
   _liveRunning = s.running;
   document.getElementById('live-section').style.display = s.running ? '' : 'none';
-  if (s.running && !wasRunning) refreshSnapshot();
+  if (s.running && !wasRunning) {
+    // Reset live view to placeholder state when daemon starts
+    const img = document.getElementById('live-img');
+    img.src = '';
+    img.style.display = 'none';
+    document.getElementById('live-placeholder').style.display = '';
+    refreshSnapshot();
+  }
 }
 
 function refreshSnapshot() {
   if (!_liveRunning) return;
-  const img = document.getElementById('live-img');
   const url = '/snapshot.jpg?t=' + Date.now();
   const tmp = new Image();
-  tmp.onload = () => { document.getElementById('live-img').src = tmp.src; setTimeout(refreshSnapshot, 2000); };
+  tmp.onload = () => {
+    const img = document.getElementById('live-img');
+    img.src = tmp.src;
+    img.style.display = '';
+    document.getElementById('live-placeholder').style.display = 'none';
+    setTimeout(refreshSnapshot, 2000);
+  };
   tmp.onerror = () => setTimeout(refreshSnapshot, 2000);
   tmp.src = url;
 }
