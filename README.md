@@ -2,7 +2,7 @@
 
 Local motion capture and livestreaming for Blink cameras — no subscription required.
 
-blinkvault keeps a continuous live stream from your Blink camera in memory, detects motion locally using frame differencing, and saves MP4 clips that include up to **30 seconds of footage before the motion event**. It uses [blinkpy](https://github.com/fronzbot/blinkpy) by Kevin Fronczak only to authenticate and open the livestream — all motion detection, buffering, and clip storage happen on your own machine. No Blink subscription required, no cloud clip storage, no always-on disk writes.
+blinkvault keeps a continuous live stream from your Blink camera in memory, detects motion locally using frame differencing, and saves MP4 clips that include a configurable amount of footage **before and after** the motion event. It uses [blinkpy](https://github.com/fronzbot/blinkpy) by Kevin Fronczak only to authenticate and open the livestream — all motion detection, buffering, and clip storage happen on your own machine. No Blink subscription required, no cloud clip storage, no always-on disk writes.
 
 ---
 
@@ -16,7 +16,7 @@ blinkvault takes a different approach:
 |---|---|---|
 | Blink subscription required | **No** | Yes (for clip history) |
 | Motion detection | **Local, frame-by-frame** | Cloud polling |
-| Pre-roll footage | **Up to 30 seconds** | None |
+| Pre-roll footage | **Configurable (default 30s)** | None |
 | Latency | **Real-time** | 30+ second delay |
 | Disk I/O at rest | **None (RAM buffer)** | Constant segment writes |
 | Setup complexity | **Single Python script** | Docker / Home Assistant |
@@ -31,19 +31,19 @@ Blink cameras do not expose RTSP. blinkvault uses [blinkpy](https://github.com/f
 
 ### In-memory rolling buffer
 
-A dedicated ffmpeg process reads raw MPEG-TS data from the local proxy and feeds it into a Python `collections.deque` — a rolling ~45 MB window of timestamped byte chunks. Nothing is written to disk while the camera is idle.
+Raw MPEG-TS data is fed directly into a Python `collections.deque` — a rolling timestamped window of byte chunks sized to your configured pre-roll. Nothing is written to disk while the camera is idle.
 
 ### Local motion detection
 
-A second ffmpeg process decodes the stream at **2 fps** and downscales to **320×180 grayscale**. Python computes the mean absolute pixel difference between consecutive frames using numpy. When the difference exceeds a configurable threshold, motion is declared. No cloud, no ML model, no subscription.
+An ffmpeg process decodes the stream at **2 fps** and downscales to **320×180 grayscale**. Python computes the mean absolute pixel difference between consecutive frames using numpy. When the difference exceeds a configurable threshold, motion is declared. No cloud, no ML model, no subscription.
 
 ### Pre-roll clips
 
-When motion fires, the in-memory buffer already contains the last 30 seconds of footage. blinkvault slices the relevant byte range, writes a single temporary `.ts` file, and converts it to a clean MP4 with `ffmpeg`. The resulting clip starts *before* the motion event — you see the person walking up to the door, not just the moment they arrived.
+When motion fires, the in-memory buffer already contains your configured pre-roll window of footage. blinkvault slices the relevant byte range, writes a single temporary `.ts` file, and converts it to a clean MP4 with `ffmpeg`. The resulting clip starts *before* the motion event — you see the person walking up to the door, not just the moment they arrived.
 
 ### Auto-reconnect
 
-Blink sessions time out after approximately 5 minutes. blinkvault detects stream termination and reconnects automatically, maintaining continuous monitoring.
+Blink sessions time out after approximately 5–6 minutes. blinkvault detects stream termination and reconnects automatically with exponential backoff, maintaining continuous monitoring.
 
 ---
 
@@ -82,23 +82,22 @@ pip install -e .
 blinkvault
 ```
 
-Or if running from source:
-```bash
-python app.py
-```
-
 Open **http://localhost:8080** in your browser.
 
 On first run you will be prompted for your Blink email, password, and a two-factor authentication code. Credentials are saved to `creds.json` (gitignored) and reused on subsequent runs.
 
 ### Features
 
-- **Start / Stop** the monitoring daemon
+- **Initiate Stream Connection / End Connection** — start and stop the monitoring daemon
+- **Live snapshot** — refreshes every 2 seconds so you can see what the camera sees
+- **● REC indicator** — pulses red in the header whenever a clip is being saved
 - **Record Now** — grab a clip on demand without waiting for motion
+- **Pre-roll** — configurable seconds of footage to include *before* the motion trigger
+- **Post-roll** — configurable seconds of footage to include *after* the motion trigger
 - **Motion sensitivity** — tune the frame-diff threshold (lower = more sensitive)
 - **Cooldown** — minimum seconds between consecutive motion triggers
-- **Clip duration** — how many seconds of post-motion footage to include
 - **Clip browser** — collapsible list with formatted timestamps, file sizes, inline playback and download
+- **Activity log** — live feed of stream events, motion triggers, and clip saves
 
 ---
 
@@ -126,6 +125,7 @@ Settings are saved to `capture_config.json` (gitignored) via the web UI, or you 
 
 ```json
 {
+  "pre_roll": 30,
   "clip_duration": 30,
   "camera_name": "",
   "motion_threshold": 10,
@@ -135,16 +135,21 @@ Settings are saved to `capture_config.json` (gitignored) via the web UI, or you 
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `clip_duration` | `30` | Seconds of post-motion footage per clip |
+| `pre_roll` | `30` | Seconds of footage before the motion trigger to include |
+| `clip_duration` | `30` | Seconds of footage after the motion trigger to include |
 | `camera_name` | `""` | Camera name as shown in the Blink app. Leave blank to use the first camera found. |
 | `motion_threshold` | `10` | Mean pixel difference to declare motion (1–50). Lower is more sensitive. |
 | `cooldown` | `60` | Minimum seconds between motion triggers |
+
+### Debug log
+
+blinkvault writes a rotating log to `blinkvault.log` in your working directory (max ~1.5 MB across 3 files). It records stream connect/disconnect events, session durations, motion triggers, clip saves, and errors.
 
 ---
 
 ## Privacy note
 
-`creds.json` contains your Blink access token. It is gitignored and never leaves your machine. Clips and config are also gitignored.
+`creds.json` contains your Blink access token. It is gitignored and never leaves your machine. Clips, config, and logs are also gitignored.
 
 ---
 
