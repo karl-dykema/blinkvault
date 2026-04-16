@@ -10,6 +10,7 @@ import asyncio
 import collections
 import json
 import logging
+import logging.handlers
 import ssl
 import subprocess
 import sys
@@ -31,6 +32,7 @@ from blinkpy.livestream import BlinkLiveStream
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("blinkvault")
+log.setLevel(logging.INFO)
 
 BASE_DIR    = Path.cwd()
 CREDS_FILE  = BASE_DIR / "creds.json"
@@ -38,9 +40,17 @@ CONFIG_FILE = BASE_DIR / "capture_config.json"
 CLIPS_DIR   = BASE_DIR / "clips"
 CLIPS_DIR.mkdir(exist_ok=True)
 
+_file_handler = logging.handlers.RotatingFileHandler(
+    BASE_DIR / "blinkvault.log", maxBytes=500_000, backupCount=2,
+    encoding="utf-8",
+)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+log.addHandler(_file_handler)
+
 PRE_ROLL_SECONDS = 30           # seconds of footage before motion to include
 
 DEFAULT_CONFIG = {
+    "pre_roll": 30,             # seconds of footage before motion to include
     "clip_duration": 30,
     "camera_name": "",          # blank = first camera found
     "motion_threshold": 10,     # mean pixel diff (0–255); lower = more sensitive
@@ -228,11 +238,11 @@ async def record_clip(camera, duration: int, out_path: Path) -> bool:
             "-map", "0:a:0?",
             "-ss", "4",               # output-side skip: drop warmup blank frames
             "-c:v", "copy",
-            "-c:a", "aac",
-            "-ar", "16000",
+            "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             "-f", "mp4",
             str(out_path),
+            stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.wait()
 
@@ -293,7 +303,7 @@ class Daemon:
             except Exception:
                 pass
         self._blink = None
-        self._emit("Daemon stopped")
+        self._emit("Stream connection closed")
 
     async def _run(self) -> None:
         self._emit("Starting — authenticating with Blink...")
@@ -328,6 +338,7 @@ class Daemon:
                         await asyncio.sleep(delay)
                     else:
                         consecutive_short = 0
+                        self._emit(f"Stream session ended normally ({duration:.0f}s) — reconnecting")
                         await asyncio.sleep(3)
                 except asyncio.CancelledError:
                     raise
@@ -345,7 +356,7 @@ class Daemon:
                         return
 
         except asyncio.CancelledError:
-            self._emit("Daemon cancelled (graceful stop)")
+            self._emit("Stream stopped")
             raise
         except BaseException as e:
             self._emit(f"Daemon crashed: {type(e).__name__}: {e}")
@@ -371,12 +382,13 @@ class Daemon:
         # Rolling in-memory buffer filled directly from recv() — no extra ffmpeg process needed
         ts_buf: collections.deque = collections.deque()
         self._ts_buf = ts_buf  # expose for Record Now
+        _pre_roll = [load_config().get("pre_roll", DEFAULT_CONFIG["pre_roll"])]
 
         def _on_data(chunk: bytes) -> None:
             now = time.monotonic()
             ts_buf.append((now, chunk))
             if not self.recording:
-                cutoff = now - PRE_ROLL_SECONDS - 2
+                cutoff = now - _pre_roll[0] - 2
                 while ts_buf and ts_buf[0][0] < cutoff:
                     ts_buf.popleft()
 
@@ -402,6 +414,7 @@ class Daemon:
         try:
             while self.running:
                 cfg = load_config()
+                _pre_roll[0] = cfg.get("pre_roll", DEFAULT_CONFIG["pre_roll"])
                 data = await analysis_proc.stdout.readexactly(frame_size)
                 frame = np.frombuffer(data, dtype=np.uint8)
                 frame_count += 1
@@ -417,12 +430,13 @@ class Daemon:
                         last_trigger = now
                         self.recording = True
                         motion_ts = now
+                        pre_roll = _pre_roll[0]
                         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                         out_path = CLIPS_DIR / f"motion_{ts}.mp4"
-                        self._emit(f"Motion! diff={diff:.1f} — saving {cfg['clip_duration']}s: {out_path.name}")
+                        self._emit(f"Motion! diff={diff:.1f} — saving {pre_roll}s pre + {cfg['clip_duration']}s post: {out_path.name}")
                         self.last_event = ts
                         asyncio.create_task(
-                            self._save_clip_from_buffer(ts_buf, motion_ts, cfg["clip_duration"], out_path)
+                            self._save_clip_from_buffer(ts_buf, motion_ts, pre_roll, cfg["clip_duration"], out_path)
                         )
 
                 prev_frame = frame
@@ -473,13 +487,13 @@ class Daemon:
             await asyncio.sleep(2)
 
     async def _save_clip_from_buffer(
-        self, ts_buf: collections.deque, motion_ts: float, duration: int, out_path: Path
+        self, ts_buf: collections.deque, motion_ts: float, pre_roll: int, duration: int, out_path: Path
     ) -> None:
         """Slice the in-memory buffer, write a temp .ts, convert to MP4."""
         try:
             await asyncio.sleep(duration + 1)
 
-            pre_start = motion_ts - PRE_ROLL_SECONDS
+            pre_start = motion_ts - pre_roll
             clip_end  = motion_ts + duration
 
             chunks = list(ts_buf)
@@ -496,15 +510,16 @@ class Daemon:
                 "-fflags", "+genpts",
                 "-i", str(tmp),
                 "-c:v", "copy",
-                "-c:a", "aac", "-ar", "16000",
+                "-c:a", "aac", "-b:a", "128k",
                 "-movflags", "+faststart",
                 "-f", "mp4", str(out_path),
+                stderr=asyncio.subprocess.DEVNULL,
             )
             await proc.wait()
             tmp.unlink(missing_ok=True)
 
             if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
-                self._emit(f"Saved: {out_path.name} ({len(raw)//1024} KB)")
+                self._emit(f"Saved: {out_path.name} ({out_path.stat().st_size//1024} KB, buf={len(raw)//1024} KB raw)")
             else:
                 self._emit(f"Failed: {out_path.name}")
         except Exception as e:
@@ -562,9 +577,10 @@ async def daemon_record_now():
     daemon.recording = True
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = CLIPS_DIR / f"manual_{ts}.mp4"
-    daemon._emit(f"Manual record — {cfg['clip_duration']}s: {out_path.name}")
+    pre_roll = cfg.get("pre_roll", DEFAULT_CONFIG["pre_roll"])
+    daemon._emit(f"Manual record — {pre_roll}s pre + {cfg['clip_duration']}s post: {out_path.name}")
     asyncio.create_task(
-        daemon._save_clip_from_buffer(daemon._ts_buf, time.monotonic(), cfg["clip_duration"], out_path)
+        daemon._save_clip_from_buffer(daemon._ts_buf, time.monotonic(), pre_roll, cfg["clip_duration"], out_path)
     )
     return {"ok": True}
 
@@ -581,7 +597,7 @@ async def status():
         "running": daemon.running,
         "recording": daemon.recording,
         "last_event": daemon.last_event,
-        "log": daemon.log[:20],
+        "log": daemon.log[:50],
         "clips": clip_data,
         "config": cfg,
     }
@@ -596,7 +612,7 @@ async def get_config():
 async def set_config(request: Request):
     data = await request.json()
     cfg = load_config()
-    for key in ("clip_duration", "camera_name", "motion_threshold", "cooldown"):
+    for key in ("pre_roll", "clip_duration", "camera_name", "motion_threshold", "cooldown"):
         if key in data:
             cfg[key] = data[key]
     save_config(cfg)
@@ -671,9 +687,13 @@ HTML = """<!DOCTYPE html>
   header h1 { font-size: 1.1rem; font-weight: 600; }
   .dot { width: 10px; height: 10px; border-radius: 50%; background: #444; flex-shrink: 0; }
   .dot.on  { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
-  .dot.rec { background: #ef4444; box-shadow: 0 0 6px #ef4444; animation: pulse 1s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
   .status-label { font-size: .8rem; color: #888; }
+  .rec-badge { font-size: .75rem; font-weight: 700; letter-spacing: .08em;
+               color: #555; background: #2a2a2a; border: 1px solid #3a3a3a;
+               border-radius: 4px; padding: 2px 7px; }
+  .rec-badge.active { color: #ef4444; border-color: #ef4444;
+                      box-shadow: 0 0 6px #ef444466; animation: pulse 1s infinite; }
   .btn { padding: 7px 16px; border: none; border-radius: 6px; cursor: pointer;
          font-size: .85rem; font-weight: 500; }
   .btn-green { background: #16a34a; color: #fff; }
@@ -726,10 +746,11 @@ HTML = """<!DOCTYPE html>
 <header>
   <div class="dot" id="dot"></div>
   <h1>blinkvault</h1>
+  <span class="rec-badge" id="rec-badge">● REC</span>
   <span class="status-label" id="status-label">Stopped</span>
   <div style="margin-left:auto; display:flex; gap:8px;">
-    <button class="btn btn-green" onclick="daemonStart()">Start</button>
-    <button class="btn btn-red"   onclick="daemonStop()">Stop</button>
+    <button class="btn btn-green" onclick="daemonStart()">Initiate Stream Connection</button>
+    <button class="btn btn-red"   onclick="daemonStop()">End Connection</button>
     <button class="btn btn-gray"  onclick="recordNow()">Record Now</button>
   </div>
 </header>
@@ -737,7 +758,9 @@ HTML = """<!DOCTYPE html>
   <div class="sidebar">
     <div class="panel">
       <h2>Config</h2>
-      <label>Clip duration (seconds)</label>
+      <label>Pre-roll — seconds before motion trigger</label>
+      <input type="number" id="cfg-preroll" min="5" max="120" value="30">
+      <label>Post-roll — seconds after motion trigger</label>
       <input type="number" id="cfg-duration" min="5" max="300" value="30">
       <label>Motion sensitivity (1–50, lower = more sensitive)</label>
       <input type="number" id="cfg-threshold" min="1" max="50" value="10">
@@ -770,12 +793,19 @@ async function api(method, path, body) {
   return r.json();
 }
 
-async function daemonStart() { await api('POST', '/daemon/start'); }
-async function daemonStop()  { await api('POST', '/daemon/stop');  }
-async function recordNow()   { await api('POST', '/daemon/record'); }
+const _localLog = [];
+function logLocal(msg) {
+  const now = new Date().toLocaleTimeString('en-US', {hour:'numeric',minute:'2-digit',second:'2-digit',hour12:true});
+  _localLog.unshift(`[${now}] ${msg}`);
+}
+
+async function daemonStart() { logLocal('Stream capture requested…'); await api('POST', '/daemon/start'); await refresh(); }
+async function daemonStop()  { logLocal('Shutdown requested…');        await api('POST', '/daemon/stop');  await refresh(); }
+async function recordNow()   { logLocal('Manual record requested…');   await api('POST', '/daemon/record'); await refresh(); }
 
 async function saveConfig() {
   const cfg = {
+    pre_roll:         parseInt(document.getElementById('cfg-preroll').value),
     clip_duration:    parseInt(document.getElementById('cfg-duration').value),
     motion_threshold: parseInt(document.getElementById('cfg-threshold').value),
     cooldown:         parseInt(document.getElementById('cfg-cooldown').value),
@@ -876,7 +906,8 @@ function renderClips(clips) {
 }
 
 function renderLog(entries) {
-  document.getElementById('log-box').innerHTML = entries.map(e => `<p>${e}</p>`).join('');
+  const merged = [..._localLog, ...entries].slice(0, 40);
+  document.getElementById('log-box').innerHTML = merged.map(e => `<p>${e}</p>`).join('');
 }
 
 let _liveRunning = false;
@@ -884,8 +915,11 @@ let _liveRunning = false;
 function renderStatus(s) {
   const dot = document.getElementById('dot');
   const label = document.getElementById('status-label');
-  dot.className = 'dot' + (s.recording ? ' rec' : s.running ? ' on' : '');
-  label.textContent = s.recording ? 'Recording...' : s.running ? 'Monitoring' : 'Stopped';
+  dot.className = 'dot' + (s.running ? ' on' : '');
+  const badge = document.getElementById('rec-badge');
+  badge.className = 'rec-badge' + (s.recording ? ' active' : '');
+  label.textContent = s.running ? 'Monitoring' : 'Stopped';
+  document.getElementById('cfg-preroll').value   = s.config.pre_roll;
   document.getElementById('cfg-duration').value  = s.config.clip_duration;
   document.getElementById('cfg-threshold').value = s.config.motion_threshold;
   document.getElementById('cfg-cooldown').value  = s.config.cooldown;
